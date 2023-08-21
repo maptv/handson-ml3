@@ -1,0 +1,1347 @@
+---
+title: Setup
+jupyter: python3
+---
+
+**Chapter 17 – Autoencoders, GANs, and Diffusion Models**
+
+_This notebook contains all the sample code and solutions to the exercises in chapter 17._
+
+<table align="left">
+  <td>
+    <a href="https://colab.research.google.com/github/ageron/handson-ml3/blob/main/17_autoencoders_gans_and_diffusion_models.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+  </td>
+  <td>
+    <a target="_blank" href="https://kaggle.com/kernels/welcome?src=https://github.com/ageron/handson-ml3/blob/main/17_autoencoders_gans_and_diffusion_models.ipynb"><img src="https://kaggle.com/static/images/open-in-kaggle.svg" /></a>
+  </td>
+</table>
+
+
+
+This project requires Python 3.7 or above:
+
+```{python}
+#| id: TFSU3FCOpKzu
+#| id: TFSU3FCOpKzu
+import sys
+
+assert sys.version_info >= (3, 7)
+```
+
+It also requires Scikit-Learn ≥ 1.0.1:
+
+```{python}
+#| id: YqCwW7cMpKzw
+#| id: YqCwW7cMpKzw
+from packaging import version
+import sklearn
+
+assert version.parse(sklearn.__version__) >= version.parse("1.0.1")
+```
+
+And TensorFlow ≥ 2.8:
+
+```{python}
+#| id: 0Piq5se2pKzx
+#| id: 0Piq5se2pKzx
+import tensorflow as tf
+
+assert version.parse(tf.__version__) >= version.parse("2.8.0")
+```
+
+As we did in earlier chapters, let's define the default font sizes to make the figures prettier:
+
+```{python}
+#| id: 8d4TH3NbpKzx
+#| id: 8d4TH3NbpKzx
+import matplotlib.pyplot as plt
+
+plt.rc('font', size=14)
+plt.rc('axes', labelsize=14, titlesize=14)
+plt.rc('legend', fontsize=14)
+plt.rc('xtick', labelsize=10)
+plt.rc('ytick', labelsize=10)
+```
+
+And let's create the `images/generative` folder (if it doesn't already exist), and define the `save_fig()` function which is used through this notebook to save the figures in high-res for the book:
+
+```{python}
+#| id: PQFH5Y9PpKzy
+#| id: PQFH5Y9PpKzy
+from pathlib import Path
+
+IMAGES_PATH = Path() / "images" / "generative"
+IMAGES_PATH.mkdir(parents=True, exist_ok=True)
+
+def save_fig(fig_id, tight_layout=True, fig_extension="png", resolution=300):
+    path = IMAGES_PATH / f"{fig_id}.{fig_extension}"
+    if tight_layout:
+        plt.tight_layout()
+    plt.savefig(path, format=fig_extension, dpi=resolution)
+```
+
+This chapter can be very slow without a GPU, so let's make sure there's one, or else issue a warning:
+
+```{python}
+#| id: Ekxzo6pOpKzy
+#| id: Ekxzo6pOpKzy
+if not tf.config.list_physical_devices('GPU'):
+    print("No GPU was detected. Neural nets can be very slow without a GPU.")
+    if "google.colab" in sys.modules:
+        print("Go to Runtime > Change runtime and select a GPU hardware "
+              "accelerator.")
+    if "kaggle_secrets" in sys.modules:
+        print("Go to Settings > Accelerator and select GPU.")
+```
+
+# Performing PCA with an Undercomplete Linear Autoencoder
+
+Let's build the Autoencoder...
+
+```{python}
+import tensorflow as tf
+
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+encoder = tf.keras.Sequential([tf.keras.layers.Dense(2)])
+decoder = tf.keras.Sequential([tf.keras.layers.Dense(3)])
+autoencoder = tf.keras.Sequential([encoder, decoder])
+
+optimizer = tf.keras.optimizers.SGD(learning_rate=0.5)
+autoencoder.compile(loss="mse", optimizer=optimizer)
+```
+
+Now let's generate the same 3D dataset as we used in Chapter 8:
+
+```{python}
+# extra code – builds the same 3D dataset as in Chapter 8
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+m = 60
+X = np.zeros((m, 3))  # initialize 3D dataset
+np.random.seed(42)
+angles = (np.random.rand(m) ** 3 + 0.5) * 2 * np.pi  # uneven distribution
+X[:, 0], X[:, 1] = np.cos(angles), np.sin(angles) * 0.5  # oval
+X += 0.28 * np.random.randn(m, 3)  # add more noise
+X = Rotation.from_rotvec([np.pi / 29, -np.pi / 20, np.pi / 4]).apply(X)
+X_train = X + [0.2, 0, 0.2]  # shift a bit
+```
+
+```{python}
+history = autoencoder.fit(X_train, X_train, epochs=500, verbose=False)
+codings = encoder.predict(X_train)
+```
+
+```{python}
+fig = plt.figure(figsize=(4,3))
+plt.plot(codings[:,0], codings[:, 1], "b.")
+plt.xlabel("$z_1$", fontsize=18)
+plt.ylabel("$z_2$", fontsize=18, rotation=0)
+plt.grid(True)
+save_fig("linear_autoencoder_pca_plot")
+plt.show()
+```
+
+# Stacked Autoencoders
+
+## Implementing a Stacked Autoencoder Using Keras
+
+Let's load the fashion MNIST dataset, scale it, and split it into a training set, a validation set, and a test set:
+
+```{python}
+# extra code – loads, scales, and splits the fashion MNIST dataset
+fashion_mnist = tf.keras.datasets.fashion_mnist.load_data()
+(X_train_full, y_train_full), (X_test, y_test) = fashion_mnist
+X_train_full = X_train_full.astype(np.float32) / 255
+X_test = X_test.astype(np.float32) / 255
+X_train, X_valid = X_train_full[:-5000], X_train_full[-5000:]
+y_train, y_valid = y_train_full[:-5000], y_train_full[-5000:]
+```
+
+Let's build and train a stacked Autoencoder with 3 hidden layers and 1 output layer (i.e., 2 stacked Autoencoders).
+
+```{python}
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+stacked_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(30, activation="relu"),
+])
+stacked_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(28 * 28),
+    tf.keras.layers.Reshape([28, 28])
+])
+stacked_ae = tf.keras.Sequential([stacked_encoder, stacked_decoder])
+
+stacked_ae.compile(loss="mse", optimizer="nadam")                   
+history = stacked_ae.fit(X_train, X_train, epochs=20,
+                         validation_data=(X_valid, X_valid))
+```
+
+## Visualizing the Reconstructions
+
+This function processes a few validation images through the autoencoder and displays the original images and their reconstructions:
+
+```{python}
+import numpy as np
+
+def plot_reconstructions(model, images=X_valid, n_images=5):
+    reconstructions = np.clip(model.predict(images[:n_images]), 0, 1)
+    fig = plt.figure(figsize=(n_images * 1.5, 3))
+    for image_index in range(n_images):
+        plt.subplot(2, n_images, 1 + image_index)
+        plt.imshow(images[image_index], cmap="binary")
+        plt.axis("off")
+        plt.subplot(2, n_images, 1 + n_images + image_index)
+        plt.imshow(reconstructions[image_index], cmap="binary")
+        plt.axis("off")
+
+plot_reconstructions(stacked_ae)
+save_fig("reconstruction_plot")  # extra code – saves the high res figure
+plt.show()
+```
+
+The reconstructions look fuzzy, but remember that the images were compressed down to just 30 numbers, instead of 784.
+
+## Visualizing the Fashion MNIST Dataset
+
+```{python}
+#| id: g69nLh2GyLhC
+#| id: g69nLh2GyLhC
+#| outputId: 47f84d4f-b41f-4ef9-d653-d73506cb4839
+from sklearn.manifold import TSNE
+
+X_valid_compressed = stacked_encoder.predict(X_valid)
+tsne = TSNE(init="pca", learning_rate="auto", random_state=42)
+X_valid_2D = tsne.fit_transform(X_valid_compressed)
+```
+
+```{python}
+#| id: klppwl4gyLhC
+#| id: klppwl4gyLhC
+#| outputId: b66330ea-5d49-4153-82ce-39fb78614a64
+plt.scatter(X_valid_2D[:, 0], X_valid_2D[:, 1], c=y_valid, s=10, cmap="tab10")
+plt.show()
+```
+
+Let's make this diagram a bit prettier (adapted from [this Scikit-Learn example](https://scikit-learn.org/stable/auto_examples/manifold/plot_lle_digits.html)):
+
+```{python}
+#| id: JIkuJSpPyLhC
+#| id: JIkuJSpPyLhC
+#| outputId: 239e4fe5-7756-40c1-cc2c-70c83eee6c0f
+# extra code – beautifies the previous diagram for the book
+
+import matplotlib as mpl
+
+plt.figure(figsize=(10, 8))
+cmap = plt.cm.tab10
+Z = X_valid_2D
+Z = (Z - Z.min()) / (Z.max() - Z.min())  # normalize to the 0-1 range
+plt.scatter(Z[:, 0], Z[:, 1], c=y_valid, s=10, cmap=cmap)
+image_positions = np.array([[1., 1.]])
+for index, position in enumerate(Z):
+    dist = ((position - image_positions) ** 2).sum(axis=1)
+    if dist.min() > 0.02: # if far enough from other images
+        image_positions = np.r_[image_positions, [position]]
+        imagebox = mpl.offsetbox.AnnotationBbox(
+            mpl.offsetbox.OffsetImage(X_valid[index], cmap="binary"),
+            position, bboxprops={"edgecolor": cmap(y_valid[index]), "lw": 2})
+        plt.gca().add_artist(imagebox)
+
+plt.axis("off")
+save_fig("fashion_mnist_visualization_plot")
+plt.show()
+```
+
+## Tying weights
+
+It is common to tie the weights of the encoder and the decoder, by simply using the transpose of the encoder's weights as the decoder weights. For this, we need to use a custom layer.
+
+```{python}
+#| id: jTru0q0CyLhD
+#| id: jTru0q0CyLhD
+class DenseTranspose(tf.keras.layers.Layer):
+    def __init__(self, dense, activation=None, **kwargs):
+        super().__init__(**kwargs)
+        self.dense = dense
+        self.activation = tf.keras.activations.get(activation)
+
+    def build(self, batch_input_shape):
+        self.biases = self.add_weight(name="bias",
+                                      shape=self.dense.input_shape[-1],
+                                      initializer="zeros")
+        super().build(batch_input_shape)
+
+    def call(self, inputs):
+        Z = tf.matmul(inputs, self.dense.weights[0], transpose_b=True)
+        return self.activation(Z + self.biases)
+```
+
+```{python}
+#| id: f_mU3e6IyLhD
+#| id: f_mU3e6IyLhD
+#| outputId: e8045bff-7004-4940-8d00-295ad99c0f23
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+dense_1 = tf.keras.layers.Dense(100, activation="relu")
+dense_2 = tf.keras.layers.Dense(30, activation="relu")
+
+tied_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    dense_1,
+    dense_2
+])
+
+tied_decoder = tf.keras.Sequential([
+    DenseTranspose(dense_2, activation="relu"),
+    DenseTranspose(dense_1),
+    tf.keras.layers.Reshape([28, 28])
+])
+
+tied_ae = tf.keras.Sequential([tied_encoder, tied_decoder])
+
+# extra code – compiles and fits the model
+tied_ae.compile(loss="mse", optimizer="nadam")
+history = tied_ae.fit(X_train, X_train, epochs=10,
+                      validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: WS2bm471yLhD
+#| id: WS2bm471yLhD
+#| outputId: 8427f9cc-630f-4cc9-a1f5-7361c5eab6dc
+#| scrolled: true
+# extra code – plots reconstructions
+plot_reconstructions(tied_ae)
+plt.show()
+```
+
+## Extra Material – Training one Autoencoder at a Time
+
+```{python}
+#| id: CIqJ922pyLhE
+#| id: CIqJ922pyLhE
+def train_autoencoder(n_neurons, X_train, X_valid, n_epochs=10,
+                      output_activation=None):
+    n_inputs = X_train.shape[-1]
+    encoder = tf.keras.layers.Dense(n_neurons, activation="relu")
+    decoder = tf.keras.layers.Dense(n_inputs, activation=output_activation)
+    autoencoder = tf.keras.Sequential([encoder, decoder])
+    autoencoder.compile(loss="mse", optimizer="nadam")
+    autoencoder.fit(X_train, X_train, epochs=n_epochs,
+                    validation_data=(X_valid, X_valid))
+    return encoder, decoder, encoder(X_train), encoder(X_valid)
+```
+
+```{python}
+#| id: '-3TSUkv4yLhE'
+#| id: '-3TSUkv4yLhE'
+#| outputId: bca2fb96-7ddf-4457-b1df-30cdce8d803e
+tf.random.set_seed(42)
+
+X_train_flat = tf.keras.layers.Flatten()(X_train)
+X_valid_flat = tf.keras.layers.Flatten()(X_valid)
+enc1, dec1, X_train_enc1, X_valid_enc1 = train_autoencoder(
+    100, X_train_flat, X_valid_flat)
+enc2, dec2, _, _ = train_autoencoder(
+    30, X_train_enc1, X_valid_enc1, output_activation="relu")
+```
+
+```{python}
+#| id: FpjUrD77yLhE
+#| id: FpjUrD77yLhE
+stacked_ae_1_by_1 = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    enc1, enc2, dec2, dec1,
+    tf.keras.layers.Reshape([28, 28])
+])
+```
+
+```{python}
+#| id: KbEe4tQqyLhE
+#| id: KbEe4tQqyLhE
+#| outputId: 52eb1adf-f4c4-4029-f68b-1ef420a5daed
+plot_reconstructions(stacked_ae_1_by_1)
+plt.show()
+```
+
+If needed, we can then continue training the full stacked autoencoder for a few epochs:
+
+```{python}
+#| id: vRgEnA-WyLhF
+#| id: vRgEnA-WyLhF
+#| outputId: 3d367c4e-82d4-48d9-8757-b106edf00650
+stacked_ae_1_by_1.compile(loss="mse", optimizer="nadam")
+history = stacked_ae_1_by_1.fit(X_train, X_train, epochs=5,
+                                validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: Ln1j0u4eyLhF
+#| id: Ln1j0u4eyLhF
+#| outputId: fef0981b-6b8d-4e9d-e837-9e3c20358e9e
+plot_reconstructions(stacked_ae_1_by_1)
+plt.show()
+```
+
+## Convolutional Autoencoders
+
+Let's build a stacked Autoencoder with 3 hidden layers and 1 output layer (i.e., 2 stacked Autoencoders).
+
+```{python}
+#| id: qom8ZHdgyLhF
+#| id: qom8ZHdgyLhF
+#| outputId: 45b2544f-0812-4fc7-a4e5-d8df9f193f5f
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+conv_encoder = tf.keras.Sequential([
+    tf.keras.layers.Reshape([28, 28, 1]),
+    tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu"),
+    tf.keras.layers.MaxPool2D(pool_size=2),  # output: 14 × 14 x 16
+    tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu"),
+    tf.keras.layers.MaxPool2D(pool_size=2),  # output: 7 × 7 x 32
+    tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu"),
+    tf.keras.layers.MaxPool2D(pool_size=2),  # output: 3 × 3 x 64
+    tf.keras.layers.Conv2D(30, 3, padding="same", activation="relu"),
+    tf.keras.layers.GlobalAvgPool2D()  # output: 30
+])
+conv_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(3 * 3 * 16),
+    tf.keras.layers.Reshape((3, 3, 16)),
+    tf.keras.layers.Conv2DTranspose(32, 3, strides=2, activation="relu"),
+    tf.keras.layers.Conv2DTranspose(16, 3, strides=2, padding="same",
+                                    activation="relu"),
+    tf.keras.layers.Conv2DTranspose(1, 3, strides=2, padding="same"),
+    tf.keras.layers.Reshape([28, 28])
+])
+conv_ae = tf.keras.Sequential([conv_encoder, conv_decoder])
+
+# extra code – compiles and fits the model
+conv_ae.compile(loss="mse", optimizer="nadam")
+history = conv_ae.fit(X_train, X_train, epochs=10,
+                      validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: 6p0Yud0RyLhG
+#| id: 6p0Yud0RyLhG
+#| outputId: 7112e556-b714-4645-af12-3bb3bd7cd6ce
+# extra code – shows the reconstructions
+plot_reconstructions(conv_ae)
+plt.show()
+```
+
+# Extra Material – Recurrent Autoencoders
+
+Let's treat each Fashion MNIST image as a sequence of 28 vectors, each with 28 dimensions:
+
+```{python}
+#| id: ZGOuVy0kyLhG
+#| id: ZGOuVy0kyLhG
+tf.random.set_seed(42)
+
+recurrent_encoder = tf.keras.Sequential([
+    tf.keras.layers.LSTM(100, return_sequences=True),
+    tf.keras.layers.LSTM(30)
+])
+recurrent_decoder = tf.keras.Sequential([
+    tf.keras.layers.RepeatVector(28),
+    tf.keras.layers.LSTM(100, return_sequences=True),
+    tf.keras.layers.Dense(28)
+])
+recurrent_ae = tf.keras.Sequential([recurrent_encoder, recurrent_decoder])
+recurrent_ae.compile(loss="mse", optimizer="nadam")
+```
+
+```{python}
+#| id: 4grialnWyLhG
+#| id: 4grialnWyLhG
+#| outputId: e6bb8d79-9a57-4fd3-e336-b81687de6781
+history = recurrent_ae.fit(X_train, X_train, epochs=10,
+                           validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: ZLOnTctFyLhG
+#| id: ZLOnTctFyLhG
+#| outputId: e5b59e40-09bc-4d82-bb6d-58ae7d7cc376
+plot_reconstructions(recurrent_ae)
+plt.show()
+```
+
+# Denoising Autoencoders
+
+Using dropout:
+
+```{python}
+#| id: wTKWjK3EyLhH
+#| id: wTKWjK3EyLhH
+#| outputId: 3be1a3bc-7f30-4793-955e-07bf60fc3b6e
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+dropout_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dropout(0.5),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(30, activation="relu")
+])
+dropout_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(28 * 28),
+    tf.keras.layers.Reshape([28, 28])
+])
+dropout_ae = tf.keras.Sequential([dropout_encoder, dropout_decoder])
+
+# extra code – compiles and fits the model
+dropout_ae.compile(loss="mse", optimizer="nadam")
+history = dropout_ae.fit(X_train, X_train, epochs=10,
+                         validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: Pucj7MI3yLhI
+#| id: Pucj7MI3yLhI
+#| outputId: d9a4289a-fde7-4e3b-c968-72421ddbfe6d
+# extra code – this cell generates and saves Figure 17–9
+tf.random.set_seed(42)
+dropout = tf.keras.layers.Dropout(0.5)
+plot_reconstructions(dropout_ae, dropout(X_valid, training=True))
+save_fig("dropout_denoising_plot")
+plt.show()
+```
+
+If you want, you can try replacing the `Dropout` layer with `tf.keras.layers.GaussianNoise(0.2)`.
+
+# Sparse Autoencoder
+
+Let's use the sigmoid activation function in the coding layer. Let's also add $\ell_1$ regularization to it: to do this, we add an `ActivityRegularization` layer after the coding layer. Alternatively, we could add `activity_regularizer=tf.keras.regularizers.l1(1e-4)` to the coding layer itself.
+
+```{python}
+#| id: ORrSHhNxyLhJ
+#| id: ORrSHhNxyLhJ
+#| outputId: 664ca147-e8f2-4ccf-960e-a86e60c2c60d
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+sparse_l1_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(300, activation="sigmoid"),
+    tf.keras.layers.ActivityRegularization(l1=1e-4)
+])
+sparse_l1_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(28 * 28),
+    tf.keras.layers.Reshape([28, 28])
+])
+sparse_l1_ae = tf.keras.Sequential([sparse_l1_encoder, sparse_l1_decoder])
+
+# extra code – compiles and fits the model
+sparse_l1_ae.compile(loss="mse", optimizer="nadam")
+history = sparse_l1_ae.fit(X_train, X_train, epochs=10,
+                           validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: 2vU9twBAyLhK
+#| id: 2vU9twBAyLhK
+#| outputId: feb78185-b67e-4775-c61e-3d4a8d082c75
+# extra code – shows the reconstructions
+plot_reconstructions(sparse_l1_ae)
+plt.show()
+```
+
+Let's plot the KL Divergence loss, versus the MAE and MSE:
+
+```{python}
+#| id: D0fOy7aMyLhK
+#| id: D0fOy7aMyLhK
+#| outputId: 35a609c2-6d23-462f-a519-6d93b07d0ec4
+# extra code – this cell generates and saves Figure 17–10
+p = 0.1
+q = np.linspace(0.001, 0.999, 500)
+kl_div = p * np.log(p / q) + (1 - p) * np.log((1 - p) / (1 - q))
+mse = (p - q) ** 2
+mae = np.abs(p - q)
+plt.plot([p, p], [0, 0.3], "k:")
+plt.text(0.05, 0.32, "Target\nsparsity", fontsize=14)
+plt.plot(q, kl_div, "b-", label="KL divergence")
+plt.plot(q, mae, "g--", label=r"MAE ($\ell_1$)")
+plt.plot(q, mse, "r--", linewidth=1, label=r"MSE ($\ell_2$)")
+plt.legend(loc="upper left", fontsize=14)
+plt.xlabel("Actual sparsity")
+plt.ylabel("Cost", rotation=0)
+plt.axis([0, 1, 0, 0.95])
+plt.grid(True)
+save_fig("sparsity_loss_plot")
+```
+
+Let's define a custom regularizer for KL-Divergence regularization:
+
+```{python}
+#| id: N-MoRrQGyLhK
+#| id: N-MoRrQGyLhK
+kl_divergence = tf.keras.losses.kullback_leibler_divergence
+
+class KLDivergenceRegularizer(tf.keras.regularizers.Regularizer):
+    def __init__(self, weight, target):
+        self.weight = weight
+        self.target = target
+
+    def __call__(self, inputs):
+        mean_activities = tf.reduce_mean(inputs, axis=0)
+        return self.weight * (
+            kl_divergence(self.target, mean_activities) +
+            kl_divergence(1. - self.target, 1. - mean_activities))
+```
+
+Now let's use this regularizer to push the model to have about 10% sparsity in the coding layer:
+
+```{python}
+#| id: HIoQ-1D4yLhK
+#| id: HIoQ-1D4yLhK
+#| outputId: 8874ead0-468a-47f8-9e35-4a855bace6b4
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+kld_reg = KLDivergenceRegularizer(weight=5e-3, target=0.1)
+sparse_kl_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(300, activation="sigmoid",
+                          activity_regularizer=kld_reg)
+])
+sparse_kl_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(28 * 28),
+    tf.keras.layers.Reshape([28, 28])
+])
+sparse_kl_ae = tf.keras.Sequential([sparse_kl_encoder, sparse_kl_decoder])
+
+# extra code – compiles and fits the model
+sparse_kl_ae.compile(loss="mse", optimizer="nadam")
+history = sparse_kl_ae.fit(X_train, X_train, epochs=10,
+                           validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: o0jIPg2ayLhL
+#| id: o0jIPg2ayLhL
+#| outputId: 35512003-0640-4b9a-835b-6c7af95c930f
+# extra code – shows the reconstructions
+plot_reconstructions(sparse_kl_ae)
+plt.show()
+```
+
+# Variational Autoencoder
+
+```{python}
+#| id: 64ji8G6eyLhL
+#| id: 64ji8G6eyLhL
+class Sampling(tf.keras.layers.Layer):
+    def call(self, inputs):
+        mean, log_var = inputs
+        return tf.random.normal(tf.shape(log_var)) * tf.exp(log_var / 2) + mean 
+```
+
+```{python}
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings_size = 10
+
+inputs = tf.keras.layers.Input(shape=[28, 28])
+Z = tf.keras.layers.Flatten()(inputs)
+Z = tf.keras.layers.Dense(150, activation="relu")(Z)
+Z = tf.keras.layers.Dense(100, activation="relu")(Z)
+codings_mean = tf.keras.layers.Dense(codings_size)(Z)  # μ
+codings_log_var = tf.keras.layers.Dense(codings_size)(Z)  # γ
+codings = Sampling()([codings_mean, codings_log_var])
+variational_encoder = tf.keras.Model(
+    inputs=[inputs], outputs=[codings_mean, codings_log_var, codings])
+```
+
+```{python}
+decoder_inputs = tf.keras.layers.Input(shape=[codings_size])
+x = tf.keras.layers.Dense(100, activation="relu")(decoder_inputs)
+x = tf.keras.layers.Dense(150, activation="relu")(x)
+x = tf.keras.layers.Dense(28 * 28)(x)
+outputs = tf.keras.layers.Reshape([28, 28])(x)
+variational_decoder = tf.keras.Model(inputs=[decoder_inputs], outputs=[outputs])
+```
+
+```{python}
+_, _, codings = variational_encoder(inputs)
+reconstructions = variational_decoder(codings)
+variational_ae = tf.keras.Model(inputs=[inputs], outputs=[reconstructions])
+```
+
+```{python}
+latent_loss = -0.5 * tf.reduce_sum(
+    1 + codings_log_var - tf.exp(codings_log_var) - tf.square(codings_mean),
+    axis=-1)
+variational_ae.add_loss(tf.reduce_mean(latent_loss) / 784.)
+```
+
+```{python}
+#| id: YXUKW_UPyLhL
+#| id: YXUKW_UPyLhL
+#| outputId: 6db5b948-1b3d-419b-e810-08512fa65369
+variational_ae.compile(loss="mse", optimizer="nadam")
+history = variational_ae.fit(X_train, X_train, epochs=25, batch_size=128,
+                             validation_data=(X_valid, X_valid))
+```
+
+```{python}
+#| id: FDs525puyLhL
+#| id: FDs525puyLhL
+#| outputId: 049794c0-4407-49b7-ba65-138f31d5e5dc
+#| scrolled: true
+plot_reconstructions(variational_ae)
+plt.show()
+```
+
+## Generate Fashion Images
+
+Let's generate a few random codings and decode them:
+
+```{python}
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings = tf.random.normal(shape=[3 * 7, codings_size])
+images = variational_decoder(codings).numpy()
+```
+
+Now let's plot these images:
+
+```{python}
+#| id: gzwLpDIDyLhM
+#| id: gzwLpDIDyLhM
+# extra code – this cells generates and saves Figure 17-12
+
+def plot_multiple_images(images, n_cols=None):
+    n_cols = n_cols or len(images)
+    n_rows = (len(images) - 1) // n_cols + 1
+    if images.shape[-1] == 1:
+        images = images.squeeze(axis=-1)
+    plt.figure(figsize=(n_cols, n_rows))
+    for index, image in enumerate(images):
+        plt.subplot(n_rows, n_cols, index + 1)
+        plt.imshow(image, cmap="binary")
+        plt.axis("off")
+
+plot_multiple_images(images, 7)
+save_fig("vae_generated_images_plot", tight_layout=False)
+plt.show()
+```
+
+Now let's perform semantic interpolation between 2 images:
+
+```{python}
+#| id: GsVXES9byLhM
+#| id: GsVXES9byLhM
+#| outputId: eca5be95-9eee-47d1-e9ce-50756e24d235
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings = np.zeros([7, codings_size])
+codings[:, 3] = np.linspace(-0.8, 0.8, 7)  # axis 3 looks best in this case
+images = variational_decoder(codings).numpy()
+```
+
+```{python}
+# extra code – this cell generates and saves Figure 17–13
+plot_multiple_images(images)
+save_fig("semantic_interpolation_plot", tight_layout=False)
+plt.show()
+```
+
+# Generative Adversarial Networks
+
+```{python}
+#| id: N31KxgksyLhN
+#| id: N31KxgksyLhN
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings_size = 30
+
+Dense = tf.keras.layers.Dense
+generator = tf.keras.Sequential([
+    Dense(100, activation="relu", kernel_initializer="he_normal"),
+    Dense(150, activation="relu", kernel_initializer="he_normal"),
+    Dense(28 * 28, activation="sigmoid"),
+    tf.keras.layers.Reshape([28, 28])
+])
+discriminator = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    Dense(150, activation="relu", kernel_initializer="he_normal"),
+    Dense(100, activation="relu", kernel_initializer="he_normal"),
+    Dense(1, activation="sigmoid")
+])
+gan = tf.keras.Sequential([generator, discriminator])
+```
+
+```{python}
+#| id: Qm4Uk3MTyLhN
+#| id: Qm4Uk3MTyLhN
+discriminator.compile(loss="binary_crossentropy", optimizer="rmsprop")
+discriminator.trainable = False
+gan.compile(loss="binary_crossentropy", optimizer="rmsprop")
+```
+
+```{python}
+#| id: UQoPjJthyLhN
+#| id: UQoPjJthyLhN
+batch_size = 32
+dataset = tf.data.Dataset.from_tensor_slices(X_train).shuffle(1000)
+dataset = dataset.batch(batch_size, drop_remainder=True).prefetch(1)
+```
+
+```{python}
+#| id: cxrUUhrjyLhN
+#| id: cxrUUhrjyLhN
+#| outputId: 2813bb7d-84c4-4ed2-8d03-c1fbd138c576
+def train_gan(gan, dataset, batch_size, codings_size, n_epochs):
+    generator, discriminator = gan.layers
+    for epoch in range(n_epochs):
+        print(f"Epoch {epoch + 1}/{n_epochs}")  # extra code
+        for X_batch in dataset:
+            # phase 1 - training the discriminator
+            noise = tf.random.normal(shape=[batch_size, codings_size])
+            generated_images = generator(noise)
+            X_fake_and_real = tf.concat([generated_images, X_batch], axis=0)
+            y1 = tf.constant([[0.]] * batch_size + [[1.]] * batch_size)
+            discriminator.train_on_batch(X_fake_and_real, y1)
+            # phase 2 - training the generator
+            noise = tf.random.normal(shape=[batch_size, codings_size])
+            y2 = tf.constant([[1.]] * batch_size)
+            gan.train_on_batch(noise, y2)
+        # extra code — plot images during training
+        plot_multiple_images(generated_images.numpy(), 8)
+        plt.show()
+
+train_gan(gan, dataset, batch_size, codings_size, n_epochs=50)
+```
+
+```{python}
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings = tf.random.normal(shape=[batch_size, codings_size])
+generated_images = generator.predict(codings)
+```
+
+```{python}
+#| id: NrLzMxweyLhO
+#| id: NrLzMxweyLhO
+#| outputId: b21da95e-da35-45b6-bbee-fd6e8b915382
+# extra code – this cell generates and saves Figure 17–15
+plot_multiple_images(generated_images, 8)
+save_fig("gan_generated_images_plot", tight_layout=False)
+plt.show()
+```
+
+# Deep Convolutional GAN
+
+```{python}
+#| id: NgT77mdVyLhO
+#| id: NgT77mdVyLhO
+tf.random.set_seed(42)  # extra code – ensures reproducibility on CPU
+
+codings_size = 100
+
+generator = tf.keras.Sequential([
+    tf.keras.layers.Dense(7 * 7 * 128),
+    tf.keras.layers.Reshape([7, 7, 128]),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2DTranspose(64, kernel_size=5, strides=2,
+                                    padding="same", activation="relu"),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2DTranspose(1, kernel_size=5, strides=2,
+                                    padding="same", activation="tanh"),
+])
+discriminator = tf.keras.Sequential([
+    tf.keras.layers.Conv2D(64, kernel_size=5, strides=2, padding="same",
+                        activation=tf.keras.layers.LeakyReLU(0.2)),
+    tf.keras.layers.Dropout(0.4),
+    tf.keras.layers.Conv2D(128, kernel_size=5, strides=2, padding="same",
+                        activation=tf.keras.layers.LeakyReLU(0.2)),
+    tf.keras.layers.Dropout(0.4),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(1, activation="sigmoid")
+])
+gan = tf.keras.Sequential([generator, discriminator])
+```
+
+```{python}
+#| id: 0-Sj_zc9yLhO
+#| id: 0-Sj_zc9yLhO
+# extra code – compiles the discrimator and the gan, as earlier
+discriminator.compile(loss="binary_crossentropy", optimizer="rmsprop")
+discriminator.trainable = False
+gan.compile(loss="binary_crossentropy", optimizer="rmsprop")
+```
+
+```{python}
+#| id: 4Ss7zwLGyLhO
+#| id: 4Ss7zwLGyLhO
+X_train_dcgan = X_train.reshape(-1, 28, 28, 1) * 2. - 1. # reshape and rescale
+```
+
+```{python}
+#| id: xKWHUiUqyLhP
+#| id: xKWHUiUqyLhP
+#| outputId: 576b04b2-5604-405a-a672-9693db6ef26a
+# extra code – generates the dataset and trains the GAN, just like earlier
+batch_size = 32
+dataset = tf.data.Dataset.from_tensor_slices(X_train_dcgan)
+dataset = dataset.shuffle(1000)
+dataset = dataset.batch(batch_size, drop_remainder=True).prefetch(1)
+train_gan(gan, dataset, batch_size, codings_size, n_epochs=50)
+```
+
+```{python}
+#| id: yY8_xytVyLhP
+#| id: yY8_xytVyLhP
+#| outputId: 7f3ebd45-3bc5-42ce-d0a6-5734d360cef6
+# extra code – this cell generates and saves Figure 17–16
+tf.random.set_seed(42)
+noise = tf.random.normal(shape=[batch_size, codings_size])
+generated_images = generator.predict(noise)
+plot_multiple_images(generated_images, 8)
+save_fig("dcgan_generated_images_plot", tight_layout=False)
+```
+
+# Diffusion Models
+
+Starting with an image from the dataset, at each time step $t$, the diffusion process adds Gaussian noise with mean 0 and variance $\beta_t$. The model is then trained to reverse that process. More specifically, given a noisy image produced by the forward process, and given the time $t$, the model is trained to predict the total noise that was added to the original image, scaled to variance 1.
+
+The [DDPM paper](https://arxiv.org/abs/2006.11239) increased $\beta_t$ from $\beta_1$ = 0.0001 to $\beta_T = $0.02 ($T$ is the max step), but the [Improved DDPM paper](https://arxiv.org/pdf/2102.09672.pdf) suggested using the following $\cos^2(\ldots)$ schedule instead, which gradually decreases $\bar{\alpha_t} = \prod_{i=0}^{t} \alpha_i$ from 1 to 0, where $\alpha_t = 1 - \beta_t$:
+
+```{python}
+#| id: yxPNTP3QpHAw
+#| id: yxPNTP3QpHAw
+def variance_schedule(T, s=0.008, max_beta=0.999):
+    t = np.arange(T + 1)
+    f = np.cos((t / T + s) / (1 + s) * np.pi / 2) ** 2
+    alpha = np.clip(f[1:] / f[:-1], 1 - max_beta, 1)
+    alpha = np.append(1, alpha).astype(np.float32)  # add α₀ = 1
+    beta = 1 - alpha
+    alpha_cumprod = np.cumprod(alpha)
+    return alpha, alpha_cumprod, beta  # αₜ , α̅ₜ , βₜ for t = 0 to T
+
+np.random.seed(42)  # extra code – for reproducibility
+T = 4000
+alpha, alpha_cumprod, beta = variance_schedule(T)
+```
+
+In the DDPM paper, the authors used $T = 1,000$, while in the Improved DDPM, they bumped this up to $T = 4,000$, so we use this value. The variable `alpha` is a vector containing $\alpha_0, \alpha_1, ..., \alpha_T$. The variable `alpha_cumprod` is a vector containing $\bar{\alpha_0}, \bar{\alpha_1}, ..., \bar{\alpha_T}$.
+
+Let's plot `alpha_cumprod`:
+
+```{python}
+# extra code – this cell generates and saves Figure 17–21
+plt.figure(figsize=(6, 3))
+plt.plot(beta, "r--", label=r"$\beta_t$")
+plt.plot(alpha_cumprod, "b", label=r"$\bar{\alpha}_t$")
+plt.axis([0, T, 0, 1])
+plt.grid(True)
+plt.xlabel(r"t")
+plt.legend()
+save_fig("variance_schedule_plot")
+plt.show()
+```
+
+The `prepare_batch()` function takes a batch of images and adds noise to each of them, using a different random time between 1 and $T$ for each image, and it returns a tuple containing the inputs and the targets:
+
+* The inputs are a `dict` containing the noisy images and the corresponding times. The function uses equation (4) from the DDPM paper to compute the noisy images in one shot, directly from the original images. It's a shortcut for the forward diffusion process.
+* The target is the noise that was used to produce the noisy images.
+
+```{python}
+def prepare_batch(X):
+    X = tf.cast(X[..., tf.newaxis], tf.float32) * 2 - 1  # scale from –1 to +1
+    X_shape = tf.shape(X)
+    t = tf.random.uniform([X_shape[0]], minval=1, maxval=T + 1, dtype=tf.int32)
+    alpha_cm = tf.gather(alpha_cumprod, t)
+    alpha_cm = tf.reshape(alpha_cm, [X_shape[0]] + [1] * (len(X_shape) - 1))
+    noise = tf.random.normal(X_shape)
+    return {
+        "X_noisy": alpha_cm ** 0.5 * X + (1 - alpha_cm) ** 0.5 * noise,
+        "time": t,
+    }, noise
+```
+
+Now let's prepare a `tf.data.Dataset` for training, and one for validation.
+
+```{python}
+#| id: i9qt5HPZ8rhv
+#| id: i9qt5HPZ8rhv
+def prepare_dataset(X, batch_size=32, shuffle=False):
+    ds = tf.data.Dataset.from_tensor_slices(X)
+    if shuffle:
+        ds = ds.shuffle(10_000)
+    return ds.batch(batch_size).map(prepare_batch).prefetch(1)
+
+tf.random.set_seed(43)  # extra code – ensures reproducibility on CPU
+train_set = prepare_dataset(X_train, batch_size=32, shuffle=True)
+valid_set = prepare_dataset(X_valid, batch_size=32)
+```
+
+As a quick sanity check, let's take a look at a few training samples, along with the corresponding noise to predict, and the original images (which we get by subtracting the appropriately scaled noise from the appropriately scaled noisy image):
+
+```{python}
+#| id: y8mwYDDtz6Zm
+#| colab: {base_uri: 'https://localhost:8080/', height: 271}
+#| id: y8mwYDDtz6Zm
+#| outputId: e5187d06-3d7b-4ab8-8b29-dc57c3428964
+# extra code – just a quick sanity check
+
+def subtract_noise(X_noisy, time, noise):
+    X_shape = tf.shape(X_noisy)
+    alpha_cm = tf.gather(alpha_cumprod, time)
+    alpha_cm = tf.reshape(alpha_cm, [X_shape[0]] + [1] * (len(X_shape) - 1))
+    return (X_noisy - (1 - alpha_cm) ** 0.5 * noise) / alpha_cm ** 0.5
+
+X_dict, Y_noise = list(train_set.take(1))[0]  # get the first batch
+X_original = subtract_noise(X_dict["X_noisy"], X_dict["time"], Y_noise)
+
+print("Original images")
+plot_multiple_images(X_original[:8].numpy())
+plt.show()
+print("Time steps:", X_dict["time"].numpy()[:8])
+print("Noisy images")
+plot_multiple_images(X_dict["X_noisy"][:8].numpy())
+plt.show()
+print("Noise to predict")
+plot_multiple_images(Y_noise[:8].numpy())
+plt.show()
+```
+
+Now we're ready to build the diffusion model itself. It will need to process both images and times. We will encode the times using a sinusoidal encoding, as suggested in the DDPM paper, just like in the [Attention is all you need](https://arxiv.org/abs/1706.03762) paper. Given a vector of _m_ integers representing time indices (integers), the layer returns an _m_ × _d_ matrix, where _d_ is the chosen embedding size.
+
+```{python}
+#| id: 0HGLhS4oNkNC
+#| id: 0HGLhS4oNkNC
+# extra code – implements a custom time encoding layer
+
+embed_size = 64
+
+class TimeEncoding(tf.keras.layers.Layer):
+    def __init__(self, T, embed_size, dtype=tf.float32, **kwargs):
+        super().__init__(dtype=dtype, **kwargs)
+        assert embed_size % 2 == 0, "embed_size must be even"
+        p, i = np.meshgrid(np.arange(T + 1), 2 * np.arange(embed_size // 2))
+        t_emb = np.empty((T + 1, embed_size))
+        t_emb[:, ::2] = np.sin(p / 10_000 ** (i / embed_size)).T
+        t_emb[:, 1::2] = np.cos(p / 10_000 ** (i / embed_size)).T
+        self.time_encodings = tf.constant(t_emb.astype(self.dtype))
+
+    def call(self, inputs):
+        return tf.gather(self.time_encodings, inputs)
+```
+
+Now let's build the model. In the Improved DDPM paper, they use a UNet model. We'll create a UNet-like model, that processes the image through `Conv2D` + `BatchNormalization` layers and skip connections, gradually downsampling the image (using `MaxPooling` layers with `strides=2`), then growing it back again (using `Upsampling2D` layers). Skip connections are also added across the downsampling part and the upsampling part. We also add the time encodings to the output of each block, after passing them through a `Dense` layer to resize them to the right dimension.
+
+* **Note**: an image's time encoding is added to every pixel in the image, along the last axis (channels). So the number of units in the `Conv2D` layer must correspond to the embedding size, and we must reshape the `time_enc` tensor to add the width and height dimensions.
+* This UNet implementation was inspired by keras.io's [image segmentation example](https://keras.io/examples/vision/oxford_pets_image_segmentation/), as well as from the [official diffusion models implementation](https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/models/unet.py). Compared to the first implementation, I added a few things, especially time encodings and skip connections across down/up parts. Compared to the second implementation, I removed a few things, especially the attention layers. It seemed like overkill for Fashion MNIST, but feel free to add them.
+
+```{python}
+#| id: 4QLnc8wkfXrh
+#| id: 4QLnc8wkfXrh
+def build_diffusion_model():
+    X_noisy = tf.keras.layers.Input(shape=[28, 28, 1], name="X_noisy")
+    time_input = tf.keras.layers.Input(shape=[], dtype=tf.int32, name="time")
+    time_enc = TimeEncoding(T, embed_size)(time_input)
+
+    dim = 16
+    Z = tf.keras.layers.ZeroPadding2D((3, 3))(X_noisy)
+    Z = tf.keras.layers.Conv2D(dim, 3)(Z)
+    Z = tf.keras.layers.BatchNormalization()(Z)
+    Z = tf.keras.layers.Activation("relu")(Z)
+
+    time = tf.keras.layers.Dense(dim)(time_enc)  # adapt time encoding
+    Z = time[:, tf.newaxis, tf.newaxis, :] + Z  # add time data to every pixel
+
+    skip = Z
+    cross_skips = []  # skip connections across the down & up parts of the UNet
+
+    for dim in (32, 64, 128):
+        Z = tf.keras.layers.Activation("relu")(Z)
+        Z = tf.keras.layers.SeparableConv2D(dim, 3, padding="same")(Z)
+        Z = tf.keras.layers.BatchNormalization()(Z)
+
+        Z = tf.keras.layers.Activation("relu")(Z)
+        Z = tf.keras.layers.SeparableConv2D(dim, 3, padding="same")(Z)
+        Z = tf.keras.layers.BatchNormalization()(Z)
+
+        cross_skips.append(Z)
+        Z = tf.keras.layers.MaxPooling2D(3, strides=2, padding="same")(Z)
+        skip_link = tf.keras.layers.Conv2D(dim, 1, strides=2,
+                                           padding="same")(skip)
+        Z = tf.keras.layers.add([Z, skip_link])
+
+        time = tf.keras.layers.Dense(dim)(time_enc)
+        Z = time[:, tf.newaxis, tf.newaxis, :] + Z
+        skip = Z
+
+    for dim in (64, 32, 16):
+        Z = tf.keras.layers.Activation("relu")(Z)
+        Z = tf.keras.layers.Conv2DTranspose(dim, 3, padding="same")(Z)
+        Z = tf.keras.layers.BatchNormalization()(Z)
+
+        Z = tf.keras.layers.Activation("relu")(Z)
+        Z = tf.keras.layers.Conv2DTranspose(dim, 3, padding="same")(Z)
+        Z = tf.keras.layers.BatchNormalization()(Z)
+
+        Z = tf.keras.layers.UpSampling2D(2)(Z)
+
+        skip_link = tf.keras.layers.UpSampling2D(2)(skip)
+        skip_link = tf.keras.layers.Conv2D(dim, 1, padding="same")(skip_link)
+        Z = tf.keras.layers.add([Z, skip_link])
+
+        time = tf.keras.layers.Dense(dim)(time_enc)
+        Z = time[:, tf.newaxis, tf.newaxis, :] + Z
+        Z = tf.keras.layers.concatenate([Z, cross_skips.pop()], axis=-1)
+        skip = Z
+
+    outputs = tf.keras.layers.Conv2D(1, 3, padding="same")(Z)[:, 2:-2, 2:-2]
+    return tf.keras.Model(inputs=[X_noisy, time_input], outputs=[outputs])
+```
+
+Let's train the model!
+
+```{python}
+#| id: 5chylX-Vp9te
+#| colab: {base_uri: 'https://localhost:8080/'}
+#| id: 5chylX-Vp9te
+#| outputId: fdd4f9f1-801e-4830-c8db-c8983f444ad8
+tf.random.set_seed(42)  # extra code – ensures reproducibility on the CPU
+model = build_diffusion_model()
+model.compile(loss=tf.keras.losses.Huber(), optimizer="nadam")
+
+# extra code – adds a ModelCheckpoint callback
+checkpoint_cb = tf.keras.callbacks.ModelCheckpoint("my_diffusion_model",
+                                                   save_best_only=True)
+
+history = model.fit(train_set, validation_data=valid_set, epochs=100,
+                    callbacks=[checkpoint_cb])  # extra code
+```
+
+Now that the model is trained, we can use it to generate new images. For this, we just generate Gaussian noise, and pretend this is the result of the diffusion process, and we're at time $T$. Then we use the model to predict the image at time $T - 1$, then we call it again to get $T - 2$, and so on, removing a bit of noise at each step. At the end, we get an image that looks like it's from the Fashion MNIST dataset. The equation for this reverse process is at the top of page 4 in the DDPM paper (step 4 in algorithm 2).
+
+```{python}
+#| id: vMXxz4qV8Luk
+#| id: vMXxz4qV8Luk
+def generate(model, batch_size=32):
+    X = tf.random.normal([batch_size, 28, 28, 1])
+    for t in range(T - 1, 0, -1):
+        print(f"\rt = {t}", end=" ")  # extra code – show progress
+        noise = (tf.random.normal if t > 1 else tf.zeros)(tf.shape(X))
+        X_noise = model({"X_noisy": X, "time": tf.constant([t] * batch_size)})
+        X = (
+            1 / alpha[t] ** 0.5
+            * (X - beta[t] / (1 - alpha_cumprod[t]) ** 0.5 * X_noise)
+            + (1 - alpha[t]) ** 0.5 * noise
+        )
+    return X
+
+tf.random.set_seed(42)  # extra code – ensures reproducibility on the CPU
+X_gen = generate(model)  # generated images
+```
+
+```{python}
+#| id: lfMa2NVwJuzE
+#| colab: {base_uri: 'https://localhost:8080/', height: 248}
+#| id: lfMa2NVwJuzE
+#| outputId: fc827f13-0b57-4372-a385-4cf70349ebd3
+plot_multiple_images(X_gen.numpy(), 8)
+save_fig("ddpm_generated_images_plot")
+plt.show()
+```
+
+Some of these images are really convincing! Compared to GANs, diffusion models tend to generate more diverse images, and they have surpassed GANs in image quality. Moreover, training is much more stable. However, generating images takes *much* longer.
+
+# Extra Material – Hashing Using a Binary Autoencoder
+
+Let's train an autoencoder where the encoder has a 16-neuron output layer, using the sigmoid activation function, and heavy Gaussian noise just before it. During training, the noise layer will encourage the previous layer to output large values, since small values will just be crushed by the noise. In turn, this means that the output layer will output values close to 0 or 1, thanks to the sigmoid activation function. Once we round the output values to 0s and 1s, we get a 16-bit "semantic" hash. If everything works well, images that look alike will have the same hash. This can be very useful for search engines: for example, if we store each image on a server identified by the image's semantic hash, then all similar images will end up on the same server. Users of the search engine can then provide an image to search for, and the search engine will compute the image's hash using the encoder, and quickly return all the images on the server identified by that hash.
+
+```{python}
+#| id: 3DRvS7twyLhW
+#| id: 3DRvS7twyLhW
+#| outputId: 80a63cbf-0f33-4b6c-8e25-32474da2e2fb
+tf.random.set_seed(42)
+
+hashing_encoder = tf.keras.Sequential([
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.GaussianNoise(15.),
+    tf.keras.layers.Dense(16, activation="sigmoid"),
+])
+hashing_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(28 * 28),
+    tf.keras.layers.Reshape([28, 28])
+])
+hashing_ae = tf.keras.Sequential([hashing_encoder, hashing_decoder])
+hashing_ae.compile(loss="mse", optimizer="nadam")
+history = hashing_ae.fit(X_train, X_train, epochs=10,
+                         validation_data=(X_valid, X_valid))
+```
+
+The autoencoder compresses the information so much (down to 16 bits!) that it's quite lossy, but that's okay, we're using it to produce semantic hashes, not to perfectly reconstruct the images:
+
+```{python}
+#| id: HyOsfAdiyLhW
+#| id: HyOsfAdiyLhW
+#| outputId: 678cc611-c625-434e-90b9-ad90d88baef4
+plot_reconstructions(hashing_ae)
+plt.show()
+```
+
+Now let's see what the hashes look like for the first few images in the validation set:
+
+```{python}
+#| id: Akb6fNptyLhX
+#| id: Akb6fNptyLhX
+#| outputId: efdbf0bd-1506-42ae-f1e1-7cd68d0f45a7
+hashes = hashing_encoder.predict(X_valid).round().astype(np.int32)
+hashes *= np.array([[2 ** bit for bit in range(16)]])
+hashes = hashes.sum(axis=1)
+for h in hashes[:5]:
+    print(f"{h:016b}")
+print("...")
+```
+
+Now let's find the most common image hashes in the validation set, and display a few images for each hash. In the following image, all the images on a given row have the same hash:
+
+```{python}
+#| id: hS80DfcLyLhX
+#| id: hS80DfcLyLhX
+#| outputId: 51a38569-f02e-4737-d40e-b478d8a557b3
+from collections import Counter
+
+n_hashes = 10
+n_images = 8
+
+top_hashes = Counter(hashes).most_common(n_hashes)
+
+plt.figure(figsize=(n_images, n_hashes))
+for hash_index, (image_hash, hash_count) in enumerate(top_hashes):
+    indices = (hashes == image_hash)
+    for index, image in enumerate(X_valid[indices][:n_images]):
+        plt.subplot(n_hashes, n_images, hash_index * n_images + index + 1)
+        plt.imshow(image, cmap="binary")
+        plt.axis("off")
+
+plt.show()
+```
+
+# Exercise Solutions
+
+## 1. to 8.
+
+1. Here are some of the main tasks that autoencoders are used for:
+    * Feature extraction
+    * Unsupervised pretraining
+    * Dimensionality reduction
+    * Generative models
+    * Anomaly detection (an autoencoder is generally bad at reconstructing outliers)
+2. If you want to train a classifier and you have plenty of unlabeled training data but only a few thousand labeled instances, then you could first train a deep autoencoder on the full dataset (labeled + unlabeled), then reuse its lower half for the classifier (i.e., reuse the layers up to the codings layer, included) and train the classifier using the labeled data. If you have little labeled data, you probably want to freeze the reused layers when training the classifier.
+3. The fact that an autoencoder perfectly reconstructs its inputs does not necessarily mean that it is a good autoencoder; perhaps it is simply an overcomplete autoencoder that learned to copy its inputs to the codings layer and then to the outputs. In fact, even if the codings layer contained a single neuron, it would be possible for a very deep autoencoder to learn to map each training instance to a different coding (e.g., the first instance could be mapped to 0.001, the second to 0.002, the third to 0.003, and so on), and it could learn "by heart" to reconstruct the right training instance for each coding. It would perfectly reconstruct its inputs without really learning any useful pattern in the data. In practice such a mapping is unlikely to happen, but it illustrates the fact that perfect reconstructions are not a guarantee that the autoencoder learned anything useful. However, if it produces very bad reconstructions, then it is almost guaranteed to be a bad autoencoder. To evaluate the performance of an autoencoder, one option is to measure the reconstruction loss (e.g., compute the MSE, or the mean square of the outputs minus the inputs). Again, a high reconstruction loss is a good sign that the autoencoder is bad, but a low reconstruction loss is not a guarantee that it is good. You should also evaluate the autoencoder according to what it will be used for. For example, if you are using it for unsupervised pretraining of a classifier, then you should also evaluate the classifier's performance.
+4. An undercomplete autoencoder is one whose codings layer is smaller than the input and output layers. If it is larger, then it is an overcomplete autoencoder. The main risk of an excessively undercomplete autoencoder is that it may fail to reconstruct the inputs. The main risk of an overcomplete autoencoder is that it may just copy the inputs to the outputs, without learning any useful features.
+5. To tie the weights of an encoder layer and its corresponding decoder layer, you simply make the decoder weights equal to the transpose of the encoder weights. This reduces the number of parameters in the model by half, often making training converge faster with less training data and reducing the risk of overfitting the training set.
+6. A generative model is a model capable of randomly generating outputs that resemble the training instances. For example, once trained successfully on the MNIST dataset, a generative model can be used to randomly generate realistic images of digits. The output distribution is typically similar to the training data. For example, since MNIST contains many images of each digit, the generative model would output roughly the same number of images of each digit. Some generative models can be parametrized—for example, to generate only some kinds of outputs. An example of a generative autoencoder is the variational autoencoder.
+7. A generative adversarial network is a neural network architecture composed of two parts, the generator and the discriminator, which have opposing objectives. The generator's goal is to generate instances similar to those in the training set, to fool the discriminator. The discriminator must distinguish the real instances from the generated ones. At each training iteration, the discriminator is trained like a normal binary classifier, then the generator is trained to maximize the discriminator's error. GANs are used for advanced image processing tasks such as super resolution, colorization, image editing (replacing objects with realistic background), turning a simple sketch into a photorealistic image, or predicting the next frames in a video. They are also used to augment a dataset (to train other models), to generate other types of data (such as text, audio, and time series), and to identify the weaknesses in other models and strengthen them.
+8. Training GANs is notoriously difficult, because of the complex dynamics between the generator and the discriminator. The biggest difficulty is mode collapse, where the generator produces outputs with very little diversity. Moreover, training can be terribly unstable: it may start out fine and then suddenly start oscillating or diverging, without any apparent reason. GANs are also very sensitive to the choice of hyperparameters.
+9. Diffusion models are good at generating diverse and high quality images. They are also much easier to train than GANs. However, compared to GANs and VAEs, they are much slower when generating images, since they must go through each step in the reverse diffusion process.
+
+## 10.
+_Exercise: Try using a denoising autoencoder to pretrain an image classifier. You can use MNIST (the simplest option), or a more complex image dataset such as [CIFAR10](https://homl.info/122) if you want a bigger challenge. Regardless of the dataset you're using, follow these steps:_
+* Split the dataset into a training set and a test set. Train a deep denoising autoencoder on the full training set.
+* Check that the images are fairly well reconstructed. Visualize the images that most activate each neuron in the coding layer.
+* Build a classification DNN, reusing the lower layers of the autoencoder. Train it using only 500 images from the training set. Does it perform better with or without pretraining?
+
+```{python}
+#| id: RVAVmIznyLhY
+#| id: RVAVmIznyLhY
+(X_train, y_train), (X_test, y_test) = tf.keras.datasets.cifar10.load_data()
+X_train = X_train / 255
+X_test = X_test / 255
+```
+
+```{python}
+#| id: qXcft-kHyLhY
+#| id: qXcft-kHyLhY
+tf.random.set_seed(42)
+
+denoising_encoder = tf.keras.Sequential([
+    tf.keras.layers.GaussianNoise(0.1),
+    tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu"),
+    tf.keras.layers.MaxPool2D(),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(512, activation="relu"),
+])
+```
+
+```{python}
+#| id: a2lC7XBqyLhY
+#| id: a2lC7XBqyLhY
+denoising_decoder = tf.keras.Sequential([
+    tf.keras.layers.Dense(16 * 16 * 32, activation="relu"),
+    tf.keras.layers.Reshape([16, 16, 32]),
+    tf.keras.layers.Conv2DTranspose(filters=3, kernel_size=3, strides=2,
+                                 padding="same", activation="sigmoid")
+])
+```
+
+```{python}
+#| id: RgtxA9BjyLhY
+#| id: RgtxA9BjyLhY
+#| outputId: 7b43827a-cc75-45cd-e5e0-dbd4ccfea440
+denoising_ae = tf.keras.Sequential([denoising_encoder, denoising_decoder])
+denoising_ae.compile(loss="binary_crossentropy", optimizer="nadam",
+                     metrics=["mse"])
+history = denoising_ae.fit(X_train, X_train, epochs=10,
+                           validation_data=(X_test, X_test))
+```
+
+```{python}
+#| id: dTlFyrmSyLhY
+#| id: dTlFyrmSyLhY
+#| outputId: 7a842325-f99e-4e85-962f-ba3bcbf8cdfd
+n_images = 5
+new_images = X_test[:n_images]
+new_images_noisy = new_images + np.random.randn(n_images, 32, 32, 3) * 0.1
+new_images_denoised = denoising_ae.predict(new_images_noisy)
+
+plt.figure(figsize=(6, n_images * 2))
+for index in range(n_images):
+    plt.subplot(n_images, 3, index * 3 + 1)
+    plt.imshow(new_images[index])
+    plt.axis('off')
+    if index == 0:
+        plt.title("Original")
+    plt.subplot(n_images, 3, index * 3 + 2)
+    plt.imshow(new_images_noisy[index].clip(0., 1.))
+    plt.axis('off')
+    if index == 0:
+        plt.title("Noisy")
+    plt.subplot(n_images, 3, index * 3 + 3)
+    plt.imshow(new_images_denoised[index])
+    plt.axis('off')
+    if index == 0:
+        plt.title("Denoised")
+
+plt.show()
+```
+
+## 11.
+_Exercise: Train a variational autoencoder on the image dataset of your choice, and use it to generate images. Alternatively, you can try to find an unlabeled dataset that you are interested in and see if you can generate new samples._
+
+See the VAE code above.
+
+## 12.
+_Exercise: Train a DCGAN to tackle the image dataset of your choice, and use it to generate images. Add experience replay and see if this helps. Turn it into a conditional GAN where you can control the generated class._
+
+TODO
+
